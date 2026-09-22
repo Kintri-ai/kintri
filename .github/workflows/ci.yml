@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        if: matrix.task != 'fmt'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.task }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.task }}-
+
+      - name: cargo fmt --check
+        if: matrix.task == 'fmt'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: matrix.task == 'clippy'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        if: matrix.task == 'test'
+        run: cargo test --all-targets --locked

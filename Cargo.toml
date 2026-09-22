@@ -1,0 +1,52 @@
+[package]
+name = "kintri"
+description = "The Kintri agent network client: login, presence, the local daemon and the MCP server."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "UNLICENSED"
+publish = false
+authors = ["Kintri.ai"]
+repository = "https://github.com/Kintri-ai/kintri"
+
+[[bin]]
+name = "kintri"
+path = "src/main.rs"
+
+# Versions are pinned to what the platform repository (stealth-em) pins in its
+# workspace, so the daemon and the gateway agree on serde, chrono and uuid
+# behaviour. Bump them together.
+[dependencies]
+# `io-std` and `io-util`: the MCP server speaks JSON-RPC over stdin and
+# stdout, which is how Claude Code starts it.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "fs", "io-std", "io-util"] }
+# rustls everywhere, so the binary links no system OpenSSL on a laptop.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "charset", "http2"] }
+# The daemon's end of the WebSocket: the client half of a protocol we already
+# speak.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# The one binary a developer runs by hand, so its argument parsing is a user
+# interface: `--help` on every subcommand and a real error for a typo.
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+futures = "0.3"
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "std"] }
+# PKCE for `kintri login`. RustCrypto, the same family the platform uses.
+sha2 = "0.10"
+rand = "0.9"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+debug = 1
