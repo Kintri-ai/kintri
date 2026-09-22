@@ -133,9 +133,21 @@ enum SessionCommand {
         /// Which agent.
         #[arg(long, default_value = "claude-code")]
         client: String,
+        /// Read the session id and working directory from the JSON Claude
+        /// Code writes to a hook's stdin.
+        #[arg(long)]
+        hook: bool,
     },
     /// Report the session over. Best effort; the TTL is the real mechanism.
-    End,
+    End {
+        /// The agent's own session id; without one, the session started
+        /// from the current directory.
+        #[arg(long, env = "CLAUDE_SESSION_ID")]
+        session_id: Option<String>,
+        /// Read the session id from the JSON on a hook's stdin.
+        #[arg(long)]
+        hook: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,18 +209,28 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Status => status(&store, &config_dir).await,
         Command::Doctor => doctor(&store, &config_dir).await,
 
-        Command::Session(SessionCommand::Start { session_id, client }) => {
+        Command::Session(SessionCommand::Start {
+            session_id,
+            client,
+            hook,
+        }) => {
             // The hook runs this; it must never fail a Claude Code startup,
             // so a gateway that is unreachable is reported and shrugged off.
-            if let Err(e) = start_daemon(&store, &config_dir, session_id, client).await {
+            let (session_id, cwd) = hook_identity(session_id, hook)?;
+            if let Err(e) = start_session(&store, &config_dir, session_id, client, cwd).await {
                 eprintln!("kintri: not connected ({e:#}). Claude Code continues as normal.");
             }
             Ok(())
         }
-        Command::Session(SessionCommand::End) | Command::Daemon(DaemonCommand::Stop) => {
+        Command::Session(SessionCommand::End { session_id, hook }) => {
+            let (session_id, cwd) = hook_identity(session_id, hook)?;
+            // Nothing running is the desired end state anyway.
+            let _ = end_session(&config_dir, session_id, &cwd).await;
+            Ok(())
+        }
+        Command::Daemon(DaemonCommand::Stop) => {
             match ipc::call(&config_dir, &ipc::Request::Shutdown).await {
                 Ok(_) => Ok(()),
-                // Nothing running is the desired end state anyway.
                 Err(_) => Ok(()),
             }
         }
@@ -261,7 +283,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Inbox { limit } => {
-            let value = ipc::call(&config_dir, &ipc::Request::Inbox { limit }).await?;
+            let value = ipc::call(&config_dir, &ipc::Request::Inbox { limit, cwd: None }).await?;
             let messages = value["messages"].as_array().cloned().unwrap_or_default();
             if messages.is_empty() {
                 println!("Nothing waiting.");
@@ -408,16 +430,32 @@ async fn status(store: &FileStore, config_dir: &std::path::Path) -> Result<()> {
         }
     }
     match ipc::call(config_dir, &ipc::Request::Status).await {
-        Ok(value) => println!(
-            "Daemon: {} · session {} · {} message(s) waiting",
-            if value["connected"].as_bool().unwrap_or(false) {
-                "connected"
-            } else {
-                "reconnecting"
-            },
-            value["session_id"].as_str().unwrap_or("-"),
-            value["pending_messages"].as_u64().unwrap_or(0),
-        ),
+        Ok(value) => {
+            let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+            println!(
+                "Daemon: running · {} session(s) · {} message(s) waiting",
+                sessions.len(),
+                value["pending_messages"].as_u64().unwrap_or(0),
+            );
+            for s in sessions {
+                let mut place = s["repository"].as_str().unwrap_or("-").to_owned();
+                if let Some(branch) = s["branch"].as_str() {
+                    place.push('@');
+                    place.push_str(branch);
+                }
+                println!(
+                    "  {} {} · {} · {}",
+                    if s["connected"].as_bool().unwrap_or(false) {
+                        "●"
+                    } else {
+                        "○"
+                    },
+                    s["session_id"].as_str().unwrap_or("-"),
+                    place,
+                    s["cwd"].as_str().unwrap_or("-"),
+                );
+            }
+        }
         Err(e) => println!("Daemon: not running ({e})"),
     }
     Ok(())
@@ -487,42 +525,129 @@ fn daemon_options(
     session_id: Option<String>,
     client: String,
 ) -> Result<daemon::Options> {
-    let cwd = std::env::current_dir()?;
-    let checkout = workspace::inspect(&cwd);
     Ok(daemon::Options {
         config_dir: config_dir.to_path_buf(),
-        // No session id means this is not a hook-started daemon; the process
-        // id keeps two manual daemons on one machine apart.
-        client_session_id: session_id.unwrap_or_else(|| format!("local-{}", std::process::id())),
-        client,
+        // A daemon started by hand with a session id registers it at once;
+        // one started for a hook begins empty and is told over IPC.
+        initial: session_id.map(|id| daemon::InitialSession {
+            client_session_id: id,
+            client,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        }),
         github_login: std::env::var("KINTRI_GITHUB_LOGIN").ok(),
         display_name: std::env::var("KINTRI_DISPLAY_NAME").ok(),
-        checkout,
     })
 }
 
-/// Start a daemon in the background, unless one is already answering.
-async fn start_daemon(
+/// What Claude Code writes to a hook's stdin, as far as this needs it.
+#[derive(serde::Deserialize)]
+struct HookInput {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// The session id and working directory a `session` command speaks for.
+///
+/// With `--hook`, both come from the JSON on stdin - Claude Code's own
+/// session id, and the directory it started in - which is what makes two
+/// Claude windows two sessions. Without it, an explicit `--session-id` or
+/// the calling process's parent pid stands in, and the directory is the
+/// current one.
+fn hook_identity(
+    session_id: Option<String>,
+    hook: bool,
+) -> Result<(Option<String>, std::path::PathBuf)> {
+    let mut cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut id = session_id;
+    if hook {
+        let mut raw = String::new();
+        use std::io::Read;
+        // A hook with nothing on stdin is not an error: the ids just fall
+        // back to what the process can see.
+        let _ = std::io::stdin().read_to_string(&mut raw);
+        if let Ok(input) = serde_json::from_str::<HookInput>(&raw) {
+            if id.is_none() {
+                id = input.session_id.filter(|s| !s.is_empty());
+            }
+            if let Some(dir) = input.cwd.filter(|d| !d.is_empty()) {
+                cwd = std::path::PathBuf::from(dir);
+            }
+        }
+    }
+    Ok((id, cwd))
+}
+
+/// Register this session with the daemon, starting the daemon first if
+/// nothing is answering. One path for the first session and every later one.
+async fn start_session(
     store: &FileStore,
     config_dir: &Path,
     session_id: Option<String>,
     client: String,
+    cwd: std::path::PathBuf,
 ) -> Result<()> {
     require_login(store)?;
+    ensure_daemon(config_dir).await?;
+    // Without Claude's id (a manual `kintri session start`), the parent
+    // process keeps two shells on one machine apart.
+    let client_session_id = session_id.unwrap_or_else(|| format!("local-{}", parent_pid()));
+    ipc::call(
+        config_dir,
+        &ipc::Request::Register {
+            client_session_id,
+            client,
+            cwd: cwd.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    .context("register the session with the daemon")?;
+    Ok(())
+}
+
+/// Report one session over. With no id, every session started from `cwd`.
+async fn end_session(config_dir: &Path, session_id: Option<String>, cwd: &Path) -> Result<()> {
+    let ids: Vec<String> = match session_id {
+        Some(id) => vec![id],
+        None => {
+            let status = ipc::call(config_dir, &ipc::Request::Status).await?;
+            status["sessions"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter(|s| s["cwd"].as_str().map(Path::new) == Some(cwd))
+                        .filter_map(|s| s["client_session_id"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    };
+    for client_session_id in ids {
+        ipc::call(config_dir, &ipc::Request::Unregister { client_session_id }).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    std::process::id()
+}
+
+/// Start a daemon in the background, unless one is already answering.
+async fn ensure_daemon(config_dir: &Path) -> Result<()> {
     if ipc::call(config_dir, &ipc::Request::Status).await.is_ok() {
         return Ok(());
     }
 
     let exe = std::env::current_exe().context("find this binary")?;
     let mut command = std::process::Command::new(exe);
-    command
-        .arg("daemon")
-        .arg("start")
-        .arg("--client")
-        .arg(client);
-    if let Some(id) = session_id {
-        command.arg("--session-id").arg(id);
-    }
+    command.arg("daemon").arg("start");
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

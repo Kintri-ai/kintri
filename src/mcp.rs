@@ -84,6 +84,11 @@ async fn handle(method: &str, params: Value, config_dir: &Path) -> Result<Value>
 async fn call_tool(params: Value, config_dir: &Path) -> Result<Value> {
     let name = params["name"].as_str().unwrap_or_default();
     let args = params["arguments"].clone();
+    // Claude Code does not tell an MCP server which session started it; the
+    // working directory is how the daemon finds the right one.
+    let cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .ok();
 
     let request = match name {
         "kintri_remember" => Request::Remember(json!({
@@ -93,6 +98,7 @@ async fn call_tool(params: Value, config_dir: &Path) -> Result<Value> {
             "repository": args.get("repository").cloned().unwrap_or(Value::Null),
             "files": args.get("files").cloned().unwrap_or(json!([])),
             "technologies": args.get("technologies").cloned().unwrap_or(json!([])),
+            "cwd": cwd,
         })),
         "kintri_search" => Request::Search(json!({
             "q": args.get("query").cloned().unwrap_or(Value::Null),
@@ -105,12 +111,14 @@ async fn call_tool(params: Value, config_dir: &Path) -> Result<Value> {
         "kintri_message" => Request::Message(json!({
             "target_session_id": args["target_session_id"],
             "content": args["content"],
+            "cwd": cwd,
         })),
         "kintri_inbox" => Request::Inbox {
             limit: args
                 .get("limit")
                 .and_then(|l| l.as_u64())
                 .map(|l| l as usize),
+            cwd,
         },
         other => return Ok(tool_error(format!("no such tool: {other}"))),
     };

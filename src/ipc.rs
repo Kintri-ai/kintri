@@ -19,16 +19,35 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// What somebody wants from the daemon.
+///
+/// The daemon holds one presence per Claude Code session, not one per
+/// machine, so a request that acts *as* a session (`Remember`, `Message`,
+/// `Inbox`) says where it comes from: the MCP server passes its working
+/// directory as `cwd`, and the daemon answers as the session registered from
+/// there. Claude Code does not tell an MCP server which session started it;
+/// the directory is the one fact the hook and the server share.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Is it connected, and as whom.
     Status,
+    /// Register one Claude Code session with the gateway. Idempotent on
+    /// `client_session_id`: a retried hook refreshes rather than duplicates.
+    Register {
+        client_session_id: String,
+        client: String,
+        cwd: String,
+    },
+    /// Report one session over. The others carry on.
+    Unregister { client_session_id: String },
     /// Take the messages this agent has not seen.
     Inbox {
         /// How many at most.
         #[serde(default)]
         limit: Option<usize>,
+        /// The asking process's directory, to pick the session; none means all.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Publish a memory. The body is passed through to the gateway.
     Remember(Value),
@@ -120,10 +139,32 @@ mod tests {
 
     #[test]
     fn requests_round_trip_as_tagged_json() {
-        let encoded = serde_json::to_string(&Request::Inbox { limit: Some(10) }).unwrap();
+        let encoded = serde_json::to_string(&Request::Inbox {
+            limit: Some(10),
+            cwd: None,
+        })
+        .unwrap();
         assert!(encoded.contains("\"op\":\"inbox\""));
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
-        assert!(matches!(decoded, Request::Inbox { limit: Some(10) }));
+        assert!(matches!(
+            decoded,
+            Request::Inbox {
+                limit: Some(10),
+                cwd: None
+            }
+        ));
+    }
+
+    #[test]
+    fn an_old_inbox_request_without_cwd_still_parses() {
+        let decoded: Request = serde_json::from_str(r#"{"op":"inbox","limit":5}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::Inbox {
+                limit: Some(5),
+                cwd: None
+            }
+        ));
     }
 
     #[test]
