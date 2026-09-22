@@ -1,7 +1,7 @@
 [package]
 name = "kintri"
 description = "The Kintri agent network client: login, presence, the local daemon and the MCP server."
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.82"
 license = "UNLICENSED"

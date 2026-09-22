@@ -263,6 +263,10 @@ async fn run(cli: Cli) -> Result<()> {
                     "content": content,
                     "files": file,
                     "technologies": technology,
+                    // Publish as the session for this checkout, the same way
+                    // the MCP server does - not as whichever happens to be
+                    // newest.
+                    "cwd": here(),
                 })),
             )
             .await?;
@@ -537,6 +541,14 @@ fn daemon_options(
         github_login: std::env::var("KINTRI_GITHUB_LOGIN").ok(),
         display_name: std::env::var("KINTRI_DISPLAY_NAME").ok(),
     })
+}
+
+/// The directory this command was run in, for routing to the right session.
+fn here() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// What Claude Code writes to a hook's stdin, as far as this needs it.

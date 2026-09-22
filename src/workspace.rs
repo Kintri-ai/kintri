@@ -5,7 +5,7 @@
 //! nothing here opens a source file, and there is no code path in this binary
 //! that could send one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Where an agent is working.
@@ -42,6 +42,18 @@ pub fn inspect(dir: &Path) -> Checkout {
         project,
         email,
     }
+}
+
+/// The root of the worktree `dir` sits in, if any.
+///
+/// This is what a session is keyed on, not the directory the agent happened
+/// to be standing in. `git rev-parse --show-toplevel` answers the same path
+/// from anywhere inside a checkout, and answers a *different* path for every
+/// linked worktree — which is exactly the identity wanted: two worktrees of
+/// one repository are two agents, and `apps/web` inside one of them is still
+/// that one.
+pub fn root(dir: &Path) -> Option<PathBuf> {
+    git(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
