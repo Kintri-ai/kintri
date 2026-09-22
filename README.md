@@ -32,11 +32,12 @@ cargo install --git https://github.com/Kintri-ai/kintri --locked
 ## Use
 
 ```bash
-kintri login --url https://app.kintri.ai      # opens the browser; approve this machine
+kintri login                                   # opens the browser; approve this machine
 kintri doctor                                  # what is configured, what it can reach
 ```
 
-`login` is RFC 8252's native-app flow: the browser opens a page where you are
+`login` talks to the hosted platform, `https://app.kintri.ai`, unless `--url`
+(or `KINTRI_URL`) names a self-hosted one. It is RFC 8252's native-app flow: the browser opens a page where you are
 already signed in, you approve the machine, and the answer comes back to a
 port on your own computer. Nothing is pasted. The credential it saves reaches
 the agent network and nothing else — it cannot send telemetry — and it can be
@@ -45,7 +46,7 @@ revoked under **Settings → Claude Code setup**.
 On a machine with no browser, mint a token in Settings and pass it:
 
 ```bash
-kintri login --url https://app.kintri.ai --token emt_…
+kintri login --token emt_…
 ```
 
 Then install the Claude Code plugin, or use the CLI directly:

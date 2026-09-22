@@ -33,12 +33,26 @@ use serde::{Deserialize, Serialize};
 pub struct Credentials {
     /// Base URL of the gateway, e.g. `https://agent.kintri.ai`.
     pub gateway_url: String,
+    /// The platform the developer logged in to, e.g. `https://app.kintri.ai`.
+    /// What `kintri status` shows: a person recognises the address they sign
+    /// in at, not the gateway's. Absent in files written before 0.1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_url: Option<String>,
+    /// The workspace's display name, as the approval page reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// The workspace token. Never logged, never printed, never sent anywhere
     /// but the gateway's `Authorization` header.
     pub token: String,
 }
 
 impl Credentials {
+    /// Where the developer thinks of themselves as logged in: the platform
+    /// they signed in at, or the gateway when only a token was pasted.
+    pub fn home(&self) -> &str {
+        self.workspace_url.as_deref().unwrap_or(&self.gateway_url)
+    }
+
     /// `Bearer <token>`.
     pub fn header(&self) -> String {
         format!("Bearer {}", self.token)
@@ -160,6 +174,8 @@ mod tests {
     fn a_fingerprint_identifies_without_revealing() {
         let c = Credentials {
             gateway_url: "https://example.invalid".to_owned(),
+            workspace_url: None,
+            workspace: None,
             token: "emt_abcdefghijkl_secretsecretsecret".to_owned(),
         };
         let printed = c.fingerprint();
@@ -178,6 +194,8 @@ mod tests {
 
         let creds = Credentials {
             gateway_url: "https://agent.example.invalid".to_owned(),
+            workspace_url: None,
+            workspace: None,
             token: "emt_abcdefghijkl_secret".to_owned(),
         };
         store.save(&creds).unwrap();

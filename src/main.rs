@@ -34,6 +34,9 @@ use clap::{Parser, Subcommand};
 use credentials::{Credentials, FileStore, Store};
 use serde_json::{json, Value};
 
+/// The hosted platform. `--url` / `KINTRI_URL` override it.
+const DEFAULT_URL: &str = "https://app.kintri.ai";
+
 #[derive(Parser)]
 #[command(
     name = "kintri",
@@ -53,11 +56,10 @@ struct Cli {
 enum Command {
     /// Connect this machine, through your browser.
     Login {
-        /// Your Kintri address, e.g. https://kintri.example.com
-        ///
-        /// The webapp, not the gateway: this is the URL you already sign in
-        /// to, and it tells the CLI where the gateway is.
-        #[arg(long, env = "KINTRI_URL")]
+        /// Your Kintri address: the webapp you already sign in to, which
+        /// tells the CLI where the gateway is. The hosted platform by default;
+        /// a self-hosted installation passes its own.
+        #[arg(long, env = "KINTRI_URL", default_value = DEFAULT_URL)]
         url: String,
         /// Skip the browser and use a token minted in Settings.
         ///
@@ -302,13 +304,16 @@ async fn login(
 ) -> Result<()> {
     let url = normalize_url(&url)?;
 
-    let (gateway, token, workspace) = match token {
+    let (gateway, token, workspace, workspace_url) = match token {
         // The escape hatch: a token minted in Settings, for a machine with no
         // browser. The gateway has to be named, because without the browser
         // flow nothing told us where it is.
         Some(token) => {
             let gateway = normalize_url(gateway_url.as_deref().unwrap_or(&url))?;
-            (gateway, token, None)
+            // With a pasted token the URL may well BE the gateway; only
+            // record it as the workspace when it is somewhere else.
+            let workspace_url = (gateway != url).then(|| url.clone());
+            (gateway, token, None, workspace_url)
         }
         None => {
             let granted = login::browser_login(&url).await?;
@@ -323,7 +328,12 @@ async fn login(
                     ))
                 }
             };
-            (gateway, granted.token, Some(granted.workspace))
+            (
+                gateway,
+                granted.token,
+                Some(granted.workspace),
+                Some(url.clone()),
+            )
         }
     };
 
@@ -335,6 +345,8 @@ async fn login(
 
     let credentials = Credentials {
         gateway_url: gateway,
+        workspace_url,
+        workspace,
         token,
     };
     // Proven before it is saved. A credential that turns out to be wrong at
@@ -347,11 +359,11 @@ async fn login(
         .context("the gateway did not accept this credential")?;
 
     store.save(&credentials)?;
-    match workspace {
+    match &credentials.workspace {
         Some(workspace) => println!(
             "Connected to {workspace}. This machine can now share with the team's other agents."
         ),
-        None => println!("Logged in to {}.", credentials.gateway_url),
+        None => println!("Logged in to {}.", credentials.home()),
     }
     println!("Credential saved to {}.", store.describe());
     Ok(())
@@ -378,10 +390,22 @@ fn normalize_url(raw: &str) -> Result<String> {
 async fn status(store: &FileStore, config_dir: &std::path::Path) -> Result<()> {
     match store.load()? {
         None => {
-            println!("Not logged in. Run `kintri login --url … --token …`.");
+            println!("Not logged in. Run `kintri login`.");
             return Ok(());
         }
-        Some(c) => println!("Logged in to {} as {}", c.gateway_url, c.fingerprint()),
+        Some(c) => {
+            println!("Logged in to {} as {}", c.home(), c.fingerprint());
+            let mut detail = Vec::new();
+            if let Some(w) = &c.workspace {
+                detail.push(format!("workspace {w}"));
+            }
+            if c.workspace_url.is_some() {
+                detail.push(format!("gateway {}", c.gateway_url));
+            }
+            if !detail.is_empty() {
+                println!("{}", detail.join(" · "));
+            }
+        }
     }
     match ipc::call(config_dir, &ipc::Request::Status).await {
         Ok(value) => println!(
@@ -425,6 +449,11 @@ async fn doctor(store: &FileStore, config_dir: &std::path::Path) -> Result<()> {
     match store.load()? {
         None => println!("Login            : not logged in"),
         Some(c) => {
+            match (&c.workspace_url, &c.workspace) {
+                (Some(u), Some(w)) => println!("Workspace        : {w} ({u})"),
+                (Some(u), None) => println!("Workspace        : {u}"),
+                (None, _) => {}
+            }
             println!("Gateway          : {}", c.gateway_url);
             match client::Gateway::new(&c) {
                 Ok(g) => match g.online().await {
