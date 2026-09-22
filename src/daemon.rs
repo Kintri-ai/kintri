@@ -1,13 +1,20 @@
 //! The long-lived half of the client.
 //!
-//! One process per developer machine. It owns the credential, the session, the
-//! WebSocket and the local inbox, and it is the only thing here that talks to
-//! the network - so the MCP server, the hooks and the CLI all stay credential
-//! -free and the token never appears in a subprocess environment.
+//! One process per developer machine, holding one presence **per Claude Code
+//! session**. It owns the credential, the sessions, their WebSockets and their
+//! inboxes, and it is the only thing here that talks to the network - so the
+//! MCP server, the hooks and the CLI all stay credential-free and the token
+//! never appears in a subprocess environment.
 //!
 //! ```text
-//! MCP / CLI  --unix socket-->  daemon  --wss-->  gateway
+//! hook / MCP / CLI  --unix socket-->  daemon  --wss (one per session)-->  gateway
 //! ```
+//!
+//! A developer with three Claude Code windows open is three agents to the
+//! network: each has its own session, its own repository and branch, its own
+//! inbox and its own heartbeat. The gateway's `/v1/agent` connection is bound
+//! to exactly one session (`ClientFrame::Connect`), so each session keeps its
+//! own link; what they share is the process, the credential and the socket.
 //!
 //! # Two rules it exists to keep
 //!
@@ -20,26 +27,38 @@
 //! gateway marks a message delivered when the bytes go out; this daemon acks
 //! it when `kintri_inbox` hands it to Claude. Between those two points the
 //! message is still owed, which is what makes a crash mid-handover survivable.
+//!
+//! # Which session is "this one"
+//!
+//! Claude Code tells its hooks which session they belong to (`session_id` on
+//! stdin) but tells an MCP server nothing. The one fact both share is the
+//! working directory, so a request from the MCP server carries its `cwd` and
+//! the daemon answers as the session registered from that directory - the
+//! newest one, when two windows share a checkout. A request with no match
+//! (a `kintri` command run by hand somewhere else) is answered as the newest
+//! session of all, and the inbox drains every session's messages, because a
+//! person at a terminal wants to see what arrived, wherever it was addressed.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent_protocol::{ClientFrame, MessageView, ServerFrame};
 use crate::model::AgentSessionId;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::client::Gateway;
 use crate::credentials::Credentials;
 use crate::ipc::{socket_path, Request, Response};
-use crate::workspace::Checkout;
+use crate::workspace::{self, Checkout};
 
 /// Reconnect delays, in seconds, then repeat the last one.
 ///
@@ -49,22 +68,29 @@ use crate::workspace::Checkout;
 /// the gateway what the outage did.
 const BACKOFF_SECS: [u64; 6] = [1, 2, 5, 10, 30, 60];
 
-/// How many messages the local inbox holds before the oldest is dropped.
+/// How many messages one session's inbox holds before the oldest is dropped.
 ///
 /// Bounded on purpose: a Claude that never calls `kintri_inbox` must not turn
 /// this process into a memory leak on somebody's laptop.
 const INBOX_CAPACITY: usize = 500;
 
-/// Everything the daemon shares between its tasks.
-struct State {
-    gateway: Gateway,
+/// One registered Claude Code session: its presence on the gateway, its link
+/// and its inbox.
+struct Session {
+    client_session_id: String,
     session_id: AgentSessionId,
+    client: String,
+    /// The directory the session was started in; how MCP requests find it.
+    cwd: PathBuf,
+    checkout: Checkout,
+    started_at: chrono::DateTime<chrono::Utc>,
     inbox: Mutex<VecDeque<MessageView>>,
     connected: Mutex<bool>,
-    started_at: chrono::DateTime<chrono::Utc>,
+    /// Flipped to stop this session's tasks without touching the others'.
+    stop: watch::Sender<bool>,
 }
 
-impl State {
+impl Session {
     async fn push(&self, message: MessageView) {
         let mut inbox = self.inbox.lock().await;
         if inbox.iter().any(|m| m.id == message.id) {
@@ -77,72 +103,79 @@ impl State {
         }
         inbox.push_back(message);
     }
+
+    fn describe(&self) -> Value {
+        json!({
+            "client_session_id": self.client_session_id,
+            "session_id": self.session_id,
+            "client": self.client,
+            "cwd": self.cwd,
+            "repository": self.checkout.repository,
+            "branch": self.checkout.branch,
+            "started_at": self.started_at,
+        })
+    }
+}
+
+/// Everything the daemon shares between its tasks.
+struct State {
+    gateway: Gateway,
+    /// By `client_session_id`, the id the hook knows.
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    github_login: Option<String>,
+    display_name: Option<String>,
 }
 
 /// What `kintri daemon start` was told.
 pub struct Options {
     /// Where credentials and the socket live.
     pub config_dir: PathBuf,
-    /// The agent's own session id, from the Claude Code hook.
-    pub client_session_id: String,
-    /// Which agent.
-    pub client: String,
-    /// The checkout it is working in.
-    pub checkout: Checkout,
+    /// A session to register at once, for a daemon started by hand. A daemon
+    /// started for a hook begins empty and is told about sessions over IPC.
+    pub initial: Option<InitialSession>,
     /// GitHub login, if the developer configured one.
     pub github_login: Option<String>,
     /// Display name, used only as a hint.
     pub display_name: Option<String>,
 }
 
+pub struct InitialSession {
+    pub client_session_id: String,
+    pub client: String,
+    pub cwd: PathBuf,
+}
+
 /// Run until the process is told to stop.
 pub async fn run(credentials: Credentials, options: Options) -> Result<()> {
     let gateway = Gateway::new(&credentials)?;
-
-    let registration = gateway
-        .register_session(&json!({
-            "client": options.client,
-            "client_version": env!("CARGO_PKG_VERSION"),
-            "client_session_id": options.client_session_id,
-            "project": options.checkout.project,
-            "repository": options.checkout.repository,
-            "branch": options.checkout.branch,
-            "email": options.checkout.email,
-            "github_login": options.github_login,
-            "display_name": options.display_name,
-        }))
-        .await
-        .context("register this session with the gateway")?;
-
-    tracing::info!(
-        session_id = %registration.session_id,
-        heartbeat_secs = registration.heartbeat_interval_secs,
-        "registered"
-    );
-
     let state = Arc::new(State {
         gateway,
-        session_id: registration.session_id,
-        inbox: Mutex::new(VecDeque::new()),
-        connected: Mutex::new(false),
+        sessions: Mutex::new(HashMap::new()),
         started_at: chrono::Utc::now(),
+        github_login: options.github_login,
+        display_name: options.display_name,
     });
 
+    // The socket comes up before any session is registered, so a hook that
+    // spawned this process finds it answering and registers over IPC like
+    // every later session does. One code path, not two.
     let listener = bind(&options.config_dir)?;
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let ipc = tokio::spawn(serve_ipc(listener, Arc::clone(&state), stop_tx.clone()));
-    let heartbeat_secs = registration.heartbeat_interval_secs.max(1);
-    let link = tokio::spawn(maintain_link(
-        Arc::clone(&state),
-        heartbeat_secs,
-        stop_rx.clone(),
-    ));
-    let keep_alive = tokio::spawn(keep_alive(
-        Arc::clone(&state),
-        heartbeat_secs,
-        stop_rx.clone(),
-    ));
+
+    if let Some(initial) = options.initial {
+        if let Err(e) = register(
+            &state,
+            initial.client_session_id,
+            initial.client,
+            initial.cwd,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "could not register the initial session; waiting for hooks");
+        }
+    }
 
     tokio::select! {
         _ = stop_rx.changed() => {}
@@ -152,17 +185,149 @@ pub async fn run(credentials: Credentials, options: Options) -> Result<()> {
     }
 
     ipc.abort();
-    link.abort();
-    keep_alive.abort();
     let _ = std::fs::remove_file(socket_path(&options.config_dir));
 
     // Best effort, and deliberately not retried: the TTL is what actually
-    // takes this session offline, and an end that never arrives is the case
-    // the whole design is built around.
-    if let Err(e) = state.gateway.end_session(state.session_id).await {
-        tracing::debug!(error = %e, "could not report the end of the session");
+    // takes a session offline, and an end that never arrives is the case the
+    // whole design is built around.
+    let sessions: Vec<Arc<Session>> = state
+        .sessions
+        .lock()
+        .await
+        .drain()
+        .map(|(_, s)| s)
+        .collect();
+    for session in sessions {
+        let _ = session.stop.send(true);
+        if let Err(e) = state.gateway.end_session(session.session_id).await {
+            tracing::debug!(error = %e, session = %session.session_id, "could not report the end of a session");
+        }
     }
     Ok(())
+}
+
+/// Register a session with the gateway and start keeping it alive.
+///
+/// Idempotent on `client_session_id`: a retried hook, or a daemon that was
+/// restarted under a still-running Claude, refreshes the presence rather than
+/// creating a second one. The gateway upserts on the same key.
+async fn register(
+    state: &Arc<State>,
+    client_session_id: String,
+    client: String,
+    cwd: PathBuf,
+) -> Result<Arc<Session>> {
+    if let Some(existing) = state.sessions.lock().await.get(&client_session_id) {
+        return Ok(Arc::clone(existing));
+    }
+
+    // Canonical, so the hook's `/tmp/x` and the MCP server's `/private/tmp/x`
+    // are the same directory.
+    let cwd = canonical(&cwd);
+    let checkout = workspace::inspect(&cwd);
+    let registration = state
+        .gateway
+        .register_session(&json!({
+            "client": client,
+            "client_version": env!("CARGO_PKG_VERSION"),
+            "client_session_id": client_session_id,
+            "project": checkout.project,
+            "repository": checkout.repository,
+            "branch": checkout.branch,
+            "email": checkout.email,
+            "github_login": state.github_login,
+            "display_name": state.display_name,
+        }))
+        .await
+        .context("register this session with the gateway")?;
+
+    let heartbeat_secs = registration.heartbeat_interval_secs.max(1);
+    tracing::info!(
+        session_id = %registration.session_id,
+        client_session_id = %client_session_id,
+        repository = ?checkout.repository,
+        branch = ?checkout.branch,
+        heartbeat_secs,
+        "registered"
+    );
+
+    let (stop, stop_rx) = watch::channel(false);
+    let session = Arc::new(Session {
+        client_session_id: client_session_id.clone(),
+        session_id: registration.session_id,
+        client,
+        cwd,
+        checkout,
+        started_at: chrono::Utc::now(),
+        inbox: Mutex::new(VecDeque::new()),
+        connected: Mutex::new(false),
+        stop,
+    });
+
+    let mut sessions = state.sessions.lock().await;
+    // A second hook for the same id raced us to the gateway; keep the one
+    // already in the map and let ours lapse by TTL.
+    if let Some(existing) = sessions.get(&client_session_id) {
+        return Ok(Arc::clone(existing));
+    }
+    sessions.insert(client_session_id, Arc::clone(&session));
+    drop(sessions);
+
+    tokio::spawn(maintain_link(
+        Arc::clone(state),
+        Arc::clone(&session),
+        heartbeat_secs,
+        stop_rx.clone(),
+    ));
+    tokio::spawn(keep_alive(
+        Arc::clone(state),
+        Arc::clone(&session),
+        heartbeat_secs,
+        stop_rx,
+    ));
+    Ok(session)
+}
+
+/// Take one session offline; the rest of the daemon carries on.
+async fn unregister(state: &Arc<State>, client_session_id: &str) -> Result<bool> {
+    let Some(session) = state.sessions.lock().await.remove(client_session_id) else {
+        return Ok(false);
+    };
+    let _ = session.stop.send(true);
+    if let Err(e) = state.gateway.end_session(session.session_id).await {
+        tracing::debug!(error = %e, "could not report the end of the session");
+    }
+    tracing::info!(session_id = %session.session_id, "ended");
+    Ok(true)
+}
+
+/// The sessions a request from `cwd` speaks for: those registered from that
+/// directory, newest first; or every session when nothing matches.
+async fn sessions_for(state: &State, cwd: Option<&str>) -> Vec<Arc<Session>> {
+    let all: Vec<Arc<Session>> = state.sessions.lock().await.values().cloned().collect();
+    let mut chosen: Vec<Arc<Session>> = match cwd.map(Path::new).map(canonical) {
+        Some(dir) => all.iter().filter(|s| s.cwd == dir).cloned().collect(),
+        None => Vec::new(),
+    };
+    if chosen.is_empty() {
+        chosen = all;
+    }
+    chosen.sort_by_key(|s| Reverse(s.started_at));
+    chosen
+}
+
+/// A directory with symlinks resolved, or as given when it no longer exists.
+fn canonical(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// The one session a request acts as, or an error that says why there is none.
+async fn session_for(state: &State, cwd: Option<&str>) -> Result<Arc<Session>> {
+    sessions_for(state, cwd)
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no Claude Code session is registered with the daemon yet"))
 }
 
 fn bind(config_dir: &Path) -> Result<UnixListener> {
@@ -188,28 +353,29 @@ fn restrict_socket(path: &Path) -> Result<()> {
         .context("restrict the daemon socket to this user")
 }
 
-/// Keep the WebSocket up, and the session alive.
+/// Keep one session's WebSocket up, and the session alive.
 async fn maintain_link(
     state: Arc<State>,
+    session: Arc<Session>,
     heartbeat_secs: u64,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let mut attempt = 0usize;
     loop {
         if *stop.borrow() {
             return;
         }
-        match connect_once(&state, heartbeat_secs, &mut stop).await {
+        match connect_once(&state, &session, heartbeat_secs, &mut stop).await {
             Ok(()) => {
                 // A clean close still means reconnecting: the session is
-                // alive as long as this process is.
+                // alive as long as it is registered.
                 attempt = 0;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "agent link dropped");
+                tracing::warn!(error = %e, session = %session.session_id, "agent link dropped");
             }
         }
-        *state.connected.lock().await = false;
+        *session.connected.lock().await = false;
         if *stop.borrow() {
             return;
         }
@@ -225,7 +391,7 @@ async fn maintain_link(
     }
 }
 
-/// Keep presence alive while the WebSocket is not.
+/// Keep one session's presence alive while its WebSocket is not.
 ///
 /// The heartbeat normally rides the connection, which is cheaper and proves
 /// more. But a gateway rollout, or a laptop that changed networks, can leave
@@ -236,8 +402,9 @@ async fn maintain_link(
 /// the reconnect, and the TTL lapsing is then the correct outcome.
 async fn keep_alive(
     state: Arc<State>,
+    session: Arc<Session>,
     heartbeat_secs: u64,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     tick.tick().await;
@@ -245,10 +412,10 @@ async fn keep_alive(
         tokio::select! {
             _ = stop.changed() => return,
             _ = tick.tick() => {
-                if *state.connected.lock().await {
+                if *session.connected.lock().await {
                     continue;
                 }
-                match state.gateway.heartbeat(state.session_id).await {
+                match state.gateway.heartbeat(session.session_id).await {
                     Ok(_) => tracing::debug!("presence kept alive over HTTP while reconnecting"),
                     Err(e) => tracing::debug!(error = %e, "HTTP heartbeat failed"),
                 }
@@ -269,8 +436,9 @@ fn jitter_ms(base_secs: u64) -> u64 {
 
 async fn connect_once(
     state: &Arc<State>,
+    session: &Arc<Session>,
     heartbeat_secs: u64,
-    stop: &mut tokio::sync::watch::Receiver<bool>,
+    stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut request = state.gateway.websocket_url().into_client_request()?;
     request.headers_mut().insert(
@@ -290,13 +458,13 @@ async fn connect_once(
     send(
         &mut sink,
         ClientFrame::Connect {
-            session_id: state.session_id,
+            session_id: session.session_id,
             client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         },
     )
     .await?;
-    *state.connected.lock().await = true;
-    tracing::info!("connected");
+    *session.connected.lock().await = true;
+    tracing::info!(session = %session.session_id, "connected");
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat.tick().await;
@@ -314,7 +482,7 @@ async fn connect_once(
                         match serde_json::from_str::<ServerFrame>(&text) {
                             Ok(ServerFrame::Message(m)) => {
                                 tracing::debug!(id = %m.id, "message received");
-                                state.push(m).await;
+                                session.push(m).await;
                             }
                             Ok(ServerFrame::Ping) => send(&mut sink, ClientFrame::Pong).await?,
                             Ok(ServerFrame::Connected { .. })
@@ -350,11 +518,7 @@ where
 }
 
 /// Answer whatever is asking on the local socket.
-async fn serve_ipc(
-    listener: UnixListener,
-    state: Arc<State>,
-    stop: tokio::sync::watch::Sender<bool>,
-) {
+async fn serve_ipc(listener: UnixListener, state: Arc<State>, stop: watch::Sender<bool>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
@@ -372,7 +536,7 @@ async fn serve_ipc(
 async fn handle_ipc(
     stream: UnixStream,
     state: Arc<State>,
-    stop: tokio::sync::watch::Sender<bool>,
+    stop: watch::Sender<bool>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -397,62 +561,109 @@ async fn handle_ipc(
     Ok(())
 }
 
+/// The `cwd` a request carries, if it does.
+fn cwd_of(body: &Value) -> Option<String> {
+    body.get("cwd").and_then(Value::as_str).map(str::to_owned)
+}
+
 async fn dispatch(
     request: Request,
     state: &Arc<State>,
-    stop: &tokio::sync::watch::Sender<bool>,
+    stop: &watch::Sender<bool>,
 ) -> Result<Value> {
     match request {
-        Request::Status => Ok(json!({
-            "session_id": state.session_id,
-            "connected": *state.connected.lock().await,
-            "pending_messages": state.inbox.lock().await.len(),
-            "started_at": state.started_at,
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
+        Request::Status => {
+            let sessions = sessions_for(state, None).await;
+            let mut listed = Vec::with_capacity(sessions.len());
+            let mut pending = 0usize;
+            let mut connected = 0usize;
+            for s in &sessions {
+                let mut view = s.describe();
+                let up = *s.connected.lock().await;
+                let waiting = s.inbox.lock().await.len();
+                if up {
+                    connected += 1;
+                }
+                pending += waiting;
+                if let Value::Object(ref mut map) = view {
+                    map.insert("connected".to_owned(), json!(up));
+                    map.insert("pending_messages".to_owned(), json!(waiting));
+                }
+                listed.push(view);
+            }
+            Ok(json!({
+                // The newest session's id, for callers that still expect one.
+                "session_id": sessions.first().map(|s| s.session_id),
+                "connected": !sessions.is_empty() && connected == sessions.len(),
+                "sessions": listed,
+                "pending_messages": pending,
+                "started_at": state.started_at,
+                "version": env!("CARGO_PKG_VERSION"),
+            }))
+        }
 
-        Request::Inbox { limit } => {
-            // Poll as well as drain: a message for an agent connected to
-            // another gateway replica is never pushed, only stored, and this
-            // is where it is found.
-            match state
-                .gateway
-                .inbox(state.session_id, limit.unwrap_or(50))
-                .await
-            {
-                Ok(polled) => {
-                    for message in polled {
-                        state.push(message).await;
+        Request::Register {
+            client_session_id,
+            client,
+            cwd,
+        } => {
+            let session = register(state, client_session_id, client, PathBuf::from(cwd)).await?;
+            Ok(session.describe())
+        }
+
+        Request::Unregister { client_session_id } => {
+            let ended = unregister(state, &client_session_id).await?;
+            Ok(json!({ "ended": ended }))
+        }
+
+        Request::Inbox { limit, cwd } => {
+            let take = limit.unwrap_or(50);
+            let mut taken: Vec<MessageView> = Vec::new();
+            for session in sessions_for(state, cwd.as_deref()).await {
+                // Poll as well as drain: a message for an agent connected to
+                // another gateway replica is never pushed, only stored, and
+                // this is where it is found.
+                match state.gateway.inbox(session.session_id, take).await {
+                    Ok(polled) => {
+                        for message in polled {
+                            session.push(message).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "inbox poll failed; using what is buffered")
                     }
                 }
-                Err(e) => tracing::debug!(error = %e, "inbox poll failed; using what is buffered"),
-            }
 
-            let take = limit.unwrap_or(50);
-            let taken: Vec<MessageView> = {
-                let mut inbox = state.inbox.lock().await;
-                let how_many = take.min(inbox.len());
-                inbox.drain(..how_many).collect()
-            };
-
-            // Acknowledged only now: the gateway called it delivered when the
-            // bytes went out, but it has only actually arrived once something
-            // has asked for it.
-            for message in &taken {
-                if let Err(e) = state
-                    .gateway
-                    .acknowledge(message.id, state.session_id)
-                    .await
-                {
-                    tracing::debug!(error = %e, "could not acknowledge a message");
+                let drained: Vec<MessageView> = {
+                    let mut inbox = session.inbox.lock().await;
+                    let how_many = take.saturating_sub(taken.len()).min(inbox.len());
+                    inbox.drain(..how_many).collect()
+                };
+                // Acknowledged only now: the gateway called it delivered when
+                // the bytes went out, but it has only actually arrived once
+                // something has asked for it.
+                for message in &drained {
+                    if let Err(e) = state
+                        .gateway
+                        .acknowledge(message.id, session.session_id)
+                        .await
+                    {
+                        tracing::debug!(error = %e, "could not acknowledge a message");
+                    }
+                }
+                taken.extend(drained);
+                if taken.len() >= take {
+                    break;
                 }
             }
             Ok(json!({ "messages": taken }))
         }
 
         Request::Remember(mut body) => {
+            let session = session_for(state, cwd_of(&body).as_deref()).await?;
             if let Value::Object(ref mut map) = body {
-                map.insert("session_id".to_owned(), json!(state.session_id));
+                map.remove("cwd");
+                map.insert("session_id".to_owned(), json!(session.session_id));
             }
             state.gateway.remember(&body).await
         }
@@ -491,8 +702,10 @@ async fn dispatch(
         }
 
         Request::Message(mut body) => {
+            let session = session_for(state, cwd_of(&body).as_deref()).await?;
             if let Value::Object(ref mut map) = body {
-                map.insert("session_id".to_owned(), json!(state.session_id));
+                map.remove("cwd");
+                map.insert("session_id".to_owned(), json!(session.session_id));
             }
             state.gateway.send_message(&body).await
         }
