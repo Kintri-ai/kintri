@@ -32,12 +32,26 @@
 //!
 //! Claude Code tells its hooks which session they belong to (`session_id` on
 //! stdin) but tells an MCP server nothing. The one fact both share is the
-//! working directory, so a request from the MCP server carries its `cwd` and
-//! the daemon answers as the session registered from that directory - the
-//! newest one, when two windows share a checkout. A request with no match
-//! (a `kintri` command run by hand somewhere else) is answered as the newest
-//! session of all, and the inbox drains every session's messages, because a
-//! person at a terminal wants to see what arrived, wherever it was addressed.
+//! working directory, so every request carries its `cwd` - and the daemon
+//! resolves that to a **worktree root** (`git rev-parse --show-toplevel`)
+//! before matching, never comparing the directory itself.
+//!
+//! That is what makes dedicated worktrees work, which is how agents are
+//! usually run. `apps/web` inside a worktree is still that worktree's agent,
+//! and two linked worktrees of one repository are two different agents even
+//! though their files and repository are identical. When two windows share a
+//! worktree, the newest wins.
+//!
+//! A request from outside every registered checkout is **refused** for
+//! `remember` and `message`. Publishing somebody's finding under a worktree
+//! they are not in is worse than failing, because nothing about it looks
+//! wrong afterwards. The inbox is the exception and still drains every
+//! session: a person at a terminal wants to see what arrived, wherever it
+//! was addressed.
+//!
+//! File paths in a memory are made relative to that same root before they
+//! leave the machine, so the workspace stores `src/daemon.rs` rather than
+//! one developer's home directory.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
@@ -80,8 +94,11 @@ struct Session {
     client_session_id: String,
     session_id: AgentSessionId,
     client: String,
-    /// The directory the session was started in; how MCP requests find it.
+    /// The directory the session was started in. Kept for display, and as the
+    /// fallback identity when the session is not in a git checkout at all.
     cwd: PathBuf,
+    /// The worktree this session is working in - what requests are matched on.
+    root: Option<PathBuf>,
     checkout: Checkout,
     started_at: chrono::DateTime<chrono::Utc>,
     inbox: Mutex<VecDeque<MessageView>>,
@@ -110,6 +127,7 @@ impl Session {
             "session_id": self.session_id,
             "client": self.client,
             "cwd": self.cwd,
+            "root": self.root,
             "repository": self.checkout.repository,
             "branch": self.checkout.branch,
             "started_at": self.started_at,
@@ -224,6 +242,7 @@ async fn register(
     // Canonical, so the hook's `/tmp/x` and the MCP server's `/private/tmp/x`
     // are the same directory.
     let cwd = canonical(&cwd);
+    let root = workspace::root(&cwd).map(|r| canonical(&r));
     let checkout = workspace::inspect(&cwd);
     let registration = state
         .gateway
@@ -245,6 +264,7 @@ async fn register(
     tracing::info!(
         session_id = %registration.session_id,
         client_session_id = %client_session_id,
+        root = ?root,
         repository = ?checkout.repository,
         branch = ?checkout.branch,
         heartbeat_secs,
@@ -257,6 +277,7 @@ async fn register(
         session_id: registration.session_id,
         client,
         cwd,
+        root,
         checkout,
         started_at: chrono::Utc::now(),
         inbox: Mutex::new(VecDeque::new()),
@@ -301,33 +322,79 @@ async fn unregister(state: &Arc<State>, client_session_id: &str) -> Result<bool>
     Ok(true)
 }
 
-/// The sessions a request from `cwd` speaks for: those registered from that
-/// directory, newest first; or every session when nothing matches.
-async fn sessions_for(state: &State, cwd: Option<&str>) -> Vec<Arc<Session>> {
-    let all: Vec<Arc<Session>> = state.sessions.lock().await.values().cloned().collect();
-    let mut chosen: Vec<Arc<Session>> = match cwd.map(Path::new).map(canonical) {
-        Some(dir) => all.iter().filter(|s| s.cwd == dir).cloned().collect(),
-        None => Vec::new(),
-    };
-    if chosen.is_empty() {
-        chosen = all;
+/// Whether a request made in `(req_root, req_cwd)` speaks for a session
+/// registered at `(session_root, session_cwd)`.
+///
+/// Worktree root first: an agent that has `cd`ed into `apps/web` is still the
+/// agent of that worktree, and two linked worktrees of one repository are two
+/// different agents. Only when neither side is in a checkout does this fall
+/// back to the directory itself, because then there is nothing better.
+///
+/// Pure, and tested: this rule decides which session a memory is published
+/// under, and getting it wrong attributes somebody's finding to the wrong
+/// branch without ever failing.
+fn speaks_for(
+    session_root: Option<&Path>,
+    session_cwd: &Path,
+    req_root: Option<&Path>,
+    req_cwd: &Path,
+) -> bool {
+    match (session_root, req_root) {
+        (Some(a), Some(b)) => a == b,
+        // One of them is not in a git checkout; only an exact directory
+        // match can say they are the same place.
+        _ => session_cwd == req_cwd,
     }
+}
+
+/// The sessions a request from `cwd` speaks for: those in the same worktree,
+/// newest first. Empty when the caller is not inside any registered checkout.
+async fn sessions_in(state: &State, cwd: Option<&str>) -> Vec<Arc<Session>> {
+    let all: Vec<Arc<Session>> = state.sessions.lock().await.values().cloned().collect();
+    let Some(req_cwd) = cwd.map(Path::new).map(canonical) else {
+        return Vec::new();
+    };
+    let req_root = workspace::root(&req_cwd).map(|r| canonical(&r));
+    let mut chosen: Vec<Arc<Session>> = all
+        .into_iter()
+        .filter(|s| speaks_for(s.root.as_deref(), &s.cwd, req_root.as_deref(), &req_cwd))
+        .collect();
     chosen.sort_by_key(|s| Reverse(s.started_at));
     chosen
+}
+
+/// Every session, newest first. What the inbox drains.
+async fn all_sessions(state: &State) -> Vec<Arc<Session>> {
+    let mut all: Vec<Arc<Session>> = state.sessions.lock().await.values().cloned().collect();
+    all.sort_by_key(|s| Reverse(s.started_at));
+    all
+}
+
+/// The one session a request acts as.
+///
+/// There is deliberately no fallback to "the newest session on the machine":
+/// publishing a memory under a worktree the agent is not in is worse than
+/// refusing, because nothing about it ever looks wrong afterwards.
+async fn session_for(state: &State, cwd: Option<&str>) -> Result<Arc<Session>> {
+    if let Some(session) = sessions_in(state, cwd).await.into_iter().next() {
+        return Ok(session);
+    }
+    let registered = state.sessions.lock().await.len();
+    Err(if registered == 0 {
+        anyhow!("no Claude Code session is registered with the daemon yet")
+    } else {
+        anyhow!(
+            "no session is registered for this checkout ({}). \
+             {registered} session(s) are registered for other worktrees; \
+             run this from a directory a Claude Code session was started in",
+            cwd.unwrap_or("unknown directory"),
+        )
+    })
 }
 
 /// A directory with symlinks resolved, or as given when it no longer exists.
 fn canonical(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-}
-
-/// The one session a request acts as, or an error that says why there is none.
-async fn session_for(state: &State, cwd: Option<&str>) -> Result<Arc<Session>> {
-    sessions_for(state, cwd)
-        .await
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no Claude Code session is registered with the daemon yet"))
 }
 
 fn bind(config_dir: &Path) -> Result<UnixListener> {
@@ -561,6 +628,45 @@ async fn handle_ipc(
     Ok(())
 }
 
+/// Strip the worktree root off any absolute path, in place.
+///
+/// A memory is shared with the whole workspace, so `src/daemon.rs` is the
+/// only form that means anything to a colleague — and an absolute path
+/// carries a username and a directory layout with it, which is more than
+/// "paths, never contents" promises.
+///
+/// A path that is already relative is left exactly as it is. It cannot be
+/// resolved without guessing what it is relative to: an agent standing in
+/// `apps/web` may mean `apps/web/lib/x.ts` or the repo-relative `lib/x.ts`,
+/// and inventing the wrong prefix is worse than passing it through, because
+/// `paths_match` on the server compares only the last two components anyway.
+fn relativise(files: &mut Value, root: Option<&Path>) {
+    let Some(root) = root else { return };
+    let Value::Array(items) = files else { return };
+    for item in items {
+        let Value::String(path) = item else { continue };
+        let candidate = Path::new(path.as_str());
+        if !candidate.is_absolute() {
+            continue;
+        }
+        // Try the path as written first, then canonicalised, so that
+        // /tmp and /private/tmp agree on macOS.
+        let rest = candidate
+            .strip_prefix(root)
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                canonical(candidate)
+                    .strip_prefix(root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            });
+        if let Some(rest) = rest {
+            *path = rest.to_string_lossy().into_owned();
+        }
+    }
+}
+
 /// The `cwd` a request carries, if it does.
 fn cwd_of(body: &Value) -> Option<String> {
     body.get("cwd").and_then(Value::as_str).map(str::to_owned)
@@ -573,7 +679,7 @@ async fn dispatch(
 ) -> Result<Value> {
     match request {
         Request::Status => {
-            let sessions = sessions_for(state, None).await;
+            let sessions = all_sessions(state).await;
             let mut listed = Vec::with_capacity(sessions.len());
             let mut pending = 0usize;
             let mut connected = 0usize;
@@ -619,7 +725,14 @@ async fn dispatch(
         Request::Inbox { limit, cwd } => {
             let take = limit.unwrap_or(50);
             let mut taken: Vec<MessageView> = Vec::new();
-            for session in sessions_for(state, cwd.as_deref()).await {
+            // A person at a terminal wants to see what arrived, wherever it
+            // was addressed - so an inbox call from outside any registered
+            // checkout drains every session rather than refusing.
+            let mut draining = sessions_in(state, cwd.as_deref()).await;
+            if draining.is_empty() {
+                draining = all_sessions(state).await;
+            }
+            for session in draining {
                 // Poll as well as drain: a message for an agent connected to
                 // another gateway replica is never pushed, only stored, and
                 // this is where it is found.
@@ -663,6 +776,9 @@ async fn dispatch(
             let session = session_for(state, cwd_of(&body).as_deref()).await?;
             if let Value::Object(ref mut map) = body {
                 map.remove("cwd");
+                if let Some(files) = map.get_mut("files") {
+                    relativise(files, session.root.as_deref());
+                }
                 map.insert("session_id".to_owned(), json!(session.session_id));
             }
             state.gateway.remember(&body).await
@@ -740,5 +856,105 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// The case dedicated worktrees make normal: the agent is registered at
+    /// the worktree root and runs a command from somewhere inside it.
+    #[test]
+    fn a_subdirectory_still_speaks_for_its_own_worktree() {
+        let root = p("/w/feature-a");
+        assert!(speaks_for(
+            Some(&root),
+            &p("/w/feature-a"),
+            Some(&root),
+            &p("/w/feature-a/apps/web"),
+        ));
+    }
+
+    /// Two linked worktrees of one repository are two different agents, even
+    /// though the repository and often the files are identical.
+    #[test]
+    fn two_worktrees_of_one_repository_are_different_agents() {
+        assert!(!speaks_for(
+            Some(&p("/w/feature-a")),
+            &p("/w/feature-a"),
+            Some(&p("/w/feature-b")),
+            &p("/w/feature-b/src"),
+        ));
+    }
+
+    /// Outside a checkout there is no root to compare, so the directory is
+    /// all there is - and it has to be the same one.
+    #[test]
+    fn outside_a_checkout_only_the_exact_directory_matches() {
+        assert!(speaks_for(
+            None,
+            &p("/tmp/scratch"),
+            None,
+            &p("/tmp/scratch")
+        ));
+        assert!(!speaks_for(
+            None,
+            &p("/tmp/scratch"),
+            None,
+            &p("/tmp/other")
+        ));
+        // One side resolved a worktree and the other did not - git failing
+        // transiently, or `.git` going away after the session registered.
+        // The directory is identical, so it is still the same place.
+        assert!(speaks_for(
+            Some(&p("/w/feature-a")),
+            &p("/w/feature-a"),
+            None,
+            &p("/w/feature-a"),
+        ));
+        // ...but a different directory is not, root or no root.
+        assert!(!speaks_for(
+            Some(&p("/w/feature-a")),
+            &p("/w/feature-a"),
+            None,
+            &p("/w/feature-a/apps/web"),
+        ));
+    }
+
+    #[test]
+    fn an_absolute_path_is_published_relative_to_the_worktree() {
+        let mut files = json!(["/w/feature-a/src/daemon.rs", "/w/feature-a/README.md"]);
+        relativise(&mut files, Some(Path::new("/w/feature-a")));
+        assert_eq!(files, json!(["src/daemon.rs", "README.md"]));
+    }
+
+    /// Anything already relative is passed through untouched: there is no way
+    /// to know what it was relative to, and the server compares the tail.
+    #[test]
+    fn a_relative_path_is_left_alone() {
+        let mut files = json!(["src/daemon.rs", "lib/network.ts"]);
+        relativise(&mut files, Some(Path::new("/w/feature-a")));
+        assert_eq!(files, json!(["src/daemon.rs", "lib/network.ts"]));
+    }
+
+    /// A path from somewhere else entirely keeps its shape rather than being
+    /// mangled into a wrong relative one.
+    #[test]
+    fn a_path_outside_the_worktree_is_untouched() {
+        let mut files = json!(["/elsewhere/src/daemon.rs"]);
+        relativise(&mut files, Some(Path::new("/w/feature-a")));
+        assert_eq!(files, json!(["/elsewhere/src/daemon.rs"]));
+    }
+
+    #[test]
+    fn with_no_worktree_nothing_is_rewritten() {
+        let mut files = json!(["/w/feature-a/src/daemon.rs"]);
+        relativise(&mut files, None);
+        assert_eq!(files, json!(["/w/feature-a/src/daemon.rs"]));
     }
 }

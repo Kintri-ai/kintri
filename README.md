@@ -85,10 +85,19 @@ TTL, as before.
 
 Claude Code does not tell an MCP server which session started it, so
 `kintri_remember`, `kintri_message` and `kintri_inbox` act as the session
-registered from the server's working directory (the newest one, when two
-windows share a checkout). Run by hand from somewhere else, `kintri inbox`
-drains every session's messages and `kintri remember` publishes as the newest.
-`kintri status` lists them all.
+registered for the **worktree** the call comes from — resolved with
+`git rev-parse --show-toplevel`, so a subdirectory like `apps/web` still
+belongs to its own worktree, and two linked worktrees of one repository stay
+two different agents. When two windows share a worktree, the newest wins.
+
+Run from outside every registered checkout, `kintri remember` refuses rather
+than guessing: publishing under the wrong worktree is worse than failing.
+`kintri inbox` is the exception and drains every session. `kintri status`
+lists them all with the worktree each resolved to.
+
+File paths in a memory are made relative to the worktree root before they are
+published, so the workspace stores `src/daemon.rs` and not your home
+directory.
 
 ## The wire format
 
