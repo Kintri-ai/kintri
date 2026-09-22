@@ -39,6 +39,7 @@
 //! session of all, and the inbox drains every session's messages, because a
 //! person at a terminal wants to see what arrived, wherever it was addressed.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -311,7 +312,7 @@ async fn sessions_for(state: &State, cwd: Option<&str>) -> Vec<Arc<Session>> {
     if chosen.is_empty() {
         chosen = all;
     }
-    chosen.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    chosen.sort_by_key(|s| Reverse(s.started_at));
     chosen
 }
 
